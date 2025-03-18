@@ -1,43 +1,35 @@
-from transformers import PretrainedConfig, PreTrainedModel
-from argparse import Namespace
+from typing import Any, Iterable, List, Optional, Set, Tuple, Union, Mapping
 import torch
-import torch.nn as nn
-import numpy as np
-from typing import Iterable, List, Optional, Tuple
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.attention import Attention, AttentionMetadata
-
 import torch.nn as nn
 import torch.nn.init as init
-import torch
+from transformers import BatchFeature
+from vllm.attention import AttentionMetadata
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.model_executor.models.gpt_bigcode import GPTBigCodeForCausalLM
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (MultiModalFieldConfig, MultiModalKwargs)
+from vllm.multimodal.parse import (MultiModalDataItems)
+from vllm.multimodal.processing import (BaseMultiModalProcessor,
+                                        BaseProcessingInfo, PromptReplacement)
+from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
+from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems, MultiModalDataItems)
+from vllm.model_executor.layers.sampler import get_sampler
+from .interfaces import SupportsLoRA, SupportsMultiModal, SupportsPP
+from .utils import (WeightsMapper)
+from transformers import (AutoTokenizer, AutoConfig, PretrainedConfig)
+from transformers.processing_utils import ProcessorMixin
+from .vision import get_vision_encoder_info
+from functools import cached_property
+from torchvision import transforms
+from torchvision.transforms.functional import InterpolationMode, pad
 
-
-import torch
-from torch import nn
-from transformers import GPTBigCodeConfig
-
-from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import get_act_fn
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    LinearMethodBase,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.sampler import Sampler
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import SamplerOutput
-
-
-from transformers import AutoTokenizer
-from vllm.model_executor.models.gpt_bigcode import GPTBigCodeConfig, GPTBigCodeModel
-
+# TODO add this manually
 from starvector.model.image_encoder.image_encoder import ImageEncoder
 
+logger = init_logger(__name__)
 
 class Swish(nn.Module):
     def __init__(self):
@@ -90,46 +82,14 @@ class Adapter(nn.Module):
                 else:
                     raise ValueError("Invalid initialization type specified.")
 
-
-
-class GPTBigCodeForCausalLM(nn.Module):
-
-    def __init__(
-        self,
-        config: GPTBigCodeConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.linear_method = linear_method
-        self.transformer = GPTBigCodeModel(config, linear_method)
-        self.lm_head_weight = self.transformer.wte.weight
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        hidden_states = self.transformer(
-            input_ids, positions, kv_caches, attn_metadata, inputs_embeds
-        )
-        return hidden_states
-
-from transformers import AutoConfig
-
 class StarCoderModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, vllm_config, prefix: str = "", **kwargs):
         super(StarCoderModel, self).__init__()
 
-        self.init_tokenizer(config.starcoder_model_name)
+        self.init_tokenizer(vllm_config.model_config.hf_config.starcoder_model_name)
 
-        self.max_length = config.max_length
-        model_config = AutoConfig.from_pretrained(config.starcoder_model_name)
+        self.max_length = vllm_config.model_config.hf_config.max_length
+        model_config = AutoConfig.from_pretrained(vllm_config.model_config.hf_config.starcoder_model_name)
 
         kwargs = {}
         kwargs["trust_remote_code"] = True
@@ -140,7 +100,13 @@ class StarCoderModel(nn.Module):
         model_config.bos_token_id = self.tokenizer.bos_token_id
         model_config.vocab_size = len(self.tokenizer)
 
-        model = GPTBigCodeForCausalLM(config=model_config)
+        vllm_config.model_config.hf_config.n_inner = model_config.n_inner
+        vllm_config.model_config.hf_config.layer_norm_epsilon = model_config.layer_norm_epsilon
+        vllm_config.model_config.hf_config.max_position_embeddings = model_config.max_position_embeddings
+        vllm_config.model_config.hf_config.activation_function = model_config.activation_function
+        vllm_config.model_config.hf_config.n_embd = model_config.n_embd
+
+        model = GPTBigCodeForCausalLM(vllm_config=vllm_config, prefix=prefix)
         self.transformer = model
 
         # Prompt the model after image
@@ -167,15 +133,17 @@ class StarCoderModel(nn.Module):
 
 
 class StarVectorModel(nn.Module):
-    def __init__(self, config, kwargs):
+    def __init__(self, vllm_config, prefix: str = "", **kwargs):
         super().__init__()
-
+        config = vllm_config.model_config.hf_config
+        config.torch_dtype = vllm_config.model_config.dtype
+        self.model_precision = config.torch_dtype
+        
         # Build Code LLM (StarCoder)
-        self.svg_transformer = StarCoderModel(config)
+        self.svg_transformer = StarCoderModel(vllm_config, prefix=prefix, **kwargs)
 
         # Task-specific layers
         self.task = kwargs.get("task", "im2svg")
-        self.model_precision = kwargs.get("model_precision", torch.float16)
         self.query_length = 0
         if self.use_image_encoder():
             # Build Image Encoder
@@ -195,16 +163,14 @@ class StarVectorModel(nn.Module):
                 dropout_prob=config.dropout,
             )
             
-            self.image_projection = self.image_projection.to(dtype=self.model_precision)
+            self.image_projection = self.image_projection.to(dtype=config.torch_dtype)
 
         self.max_length = (
             config.max_length_train - self.query_length - 3
         )  # for image, text, and svg tokens
 
     def use_image_encoder(self):
-        if (
-            self.task == "im2svg"
-        ):
+        if (self.task == "im2svg"):
             return True
         else:
             return False
@@ -271,6 +237,11 @@ class StarVectorModel(nn.Module):
 
     def embed_image(self, images):
         # Process image
+        if len(images.shape) == 5:
+            # Collapse second dimension into batch dimension
+            B, S, C, H, W = images.shape
+            images = images.reshape(B * S, C, H, W)
+        # images = torch.randn(31, 1, 3, 224, 224).to('cuda').to(torch.float16)
         embedded_image = self.image_encoder(images)
         conditioning_embeds = self.image_projection(embedded_image)
         return conditioning_embeds
@@ -289,7 +260,7 @@ class StarVectorModel(nn.Module):
     ) -> torch.Tensor:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is not None:
-            visual_embeddings = self.embed_image(image_input)
+            visual_embeddings = self.embed_image(image_input.to(self.model_precision))
             inputs_embeds = self.svg_transformer.transformer.transformer.wte(input_ids)
             mask = input_ids == self.svg_transformer.image_start_token_id
             inputs_embeds[mask] = visual_embeddings.view(-1, visual_embeddings.size(-1))
@@ -342,101 +313,311 @@ class StarVectorConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
 
+class SimpleStarVectorProcessor(ProcessorMixin):
+    attributes = ["tokenizer"]  # Only include tokenizer in attributes
+    valid_kwargs = ["size", "mean", "std"]  # Add other parameters as valid kwargs
+    image_processor_class = "AutoImageProcessor"
+    tokenizer_class = "AutoTokenizer"
 
-class StarVectorForCausalLM(PreTrainedModel):
-    config_class = StarVectorConfig
+    def __init__(self, 
+                 tokenizer=None,  # Make tokenizer the first argument
+                 size=224, 
+                 mean=None, 
+                 std=None, 
+                 **kwargs,
+                 ):
+        if mean is None:
+            mean = (0.48145466, 0.4578275, 0.40821073)
+        if std is None:
+            std = (0.26862954, 0.26130258, 0.27577711)
+
+        # Store these as instance variables
+        self.mean = mean
+        self.std = std
+        self.size = size
+        
+        self.normalize = transforms.Normalize(mean=mean, std=std)        
+        
+        self.transform = transforms.Compose([
+            transforms.Lambda(lambda img: img.convert("RGB") if img.mode == "RGBA" else img),
+            transforms.Lambda(lambda img: self._pad_to_square(img)),
+            transforms.Resize(size, interpolation=InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            self.normalize
+        ])
+
+        # Initialize parent class with tokenizer
+        super().__init__(tokenizer=tokenizer)
+
+
+    def __call__(self, images=None, text=None, **kwargs) -> BatchFeature:
+        """
+        Process images and/or text inputs.
+        
+        Args:
+            images: Optional image input(s)
+            text: Optional text input(s)
+            **kwargs: Additional arguments
+        """
+        if images is None and text is None:
+            raise ValueError("You have to specify at least one of `images` or `text`.")
+
+        image_inputs = {}
+        if images is not None:
+            if isinstance(images, (list, tuple)):
+                images_ = [self.transform(img) for img in images]
+            else:
+                images_ = self.transform(images)
+            image_inputs = {"pixel_values": images_}
+        
+        text_inputs = {}
+        if text is not None:
+            text_inputs = self.tokenizer(text, **kwargs)
+        return BatchFeature(data={**text_inputs, **image_inputs})
+
+    def _pad_to_square(self, img):
+        # Calculate padding to make the image square
+        width, height = img.size
+        max_dim = max(width, height)
+        padding = [(max_dim - width) // 2, (max_dim - height) // 2]
+        padding += [max_dim - width - padding[0], max_dim - height - padding[1]]
+        return pad(img, padding, fill=255)  # Assuming white padding
+
+
+class StarVectorProcessingInfo(BaseProcessingInfo):
+
+    def get_vision_encoder_info(self):
+        return get_vision_encoder_info(self.get_hf_config())
+    
+    def get_hf_processor(self):
+        if self.ctx.model_config.hf_config.starcoder_model_name == "bigcode/starcoderbase-1b":
+            return self.ctx.get_hf_processor(SimpleStarVectorProcessor)
+        else:
+            from vllm.model_executor.models.starvector2 import StarVector2Processor
+            return self.ctx.get_hf_processor(StarVector2Processor)
+
+    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+        return {"image": None}
+
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        config = self.ctx.model_config.hf_config
+        if config.image_encoder_type == "clip":
+            return {"image": 257}
+        else:
+            return {"image": 576}
+
+    def _apply_feature_select_strategy(
+        self,
+        strategy: str,
+        encoder_num_image_tokens: int,
+    ) -> int:
+        if strategy == "default":
+            return encoder_num_image_tokens - 1
+        if strategy == "full":
+            return encoder_num_image_tokens
+
+        msg = f"Unexpected feature select strategy: {strategy!r}"
+        raise NotImplementedError(msg)
+
+    def get_num_image_tokens(self) -> int:
+        hf_config = self.get_hf_config()
+        vision_encoder_type = hf_config.image_encoder_type
+        if vision_encoder_type == "clip":
+            return 257
+        else:
+            return 576
+
+class StarVectorDummyInputsBuilder(BaseDummyInputsBuilder[StarVectorProcessingInfo]):
+
+    def get_dummy_processor_inputs(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> ProcessorInputs:
+        num_images = mm_counts.get("image", 0)
+
+        processor = self.info.get_hf_processor()
+        image_token = '<image-start>' # processor.image_token
+        if isinstance(processor, SimpleStarVectorProcessor):
+            mm_data = {"image": self._get_dummy_images(width=processor.size,
+                                   height=processor.size,
+                                   num_images=1)[0]}
+        else:
+            mm_data = {"image": self._get_dummy_images(width=processor.size['width'],
+                                   height=processor.size['height'],
+                                   num_images=1)[0]}
+
+        return ProcessorInputs(
+            prompt_text=image_token * num_images,
+            mm_data=mm_data,
+        )
+
+
+class StarVectorMultiModalProcessor(BaseMultiModalProcessor[StarVectorProcessingInfo]):
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        
+        return dict(
+            pixel_values=MultiModalFieldConfig.batched("image"),
+            image_embeds=MultiModalFieldConfig.batched("image"),
+        )
+    def _get_prompt_replacements(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargs,
+    ) -> list[PromptReplacement]:
+        image_token_id = 49154
+        def get_replacement(item_idx: int):
+            images = mm_items.get_items(
+                "image", (ImageEmbeddingItems, ImageProcessorItems))
+
+            if isinstance(images, ImageEmbeddingItems):
+                num_image_tokens = images.get_feature_size(item_idx)
+            else:
+                num_image_tokens = self.info.get_num_image_tokens()
+
+            return [image_token_id] * num_image_tokens
+
+        return [
+            PromptReplacement(
+                modality="image",
+                target=[image_token_id],
+                replacement=get_replacement,
+            ),
+        ]
+
+@MULTIMODAL_REGISTRY.register_processor(
+    StarVectorMultiModalProcessor,
+    info=StarVectorProcessingInfo,
+    dummy_inputs=StarVectorDummyInputsBuilder,
+)
+class StarVectorForCausalLM(nn.Module, SupportsMultiModal, SupportsLoRA, SupportsPP):
+
     _no_split_modules = []
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ]
+    } 
+    # LoRA specific attributes
+    supported_lora_modules = [r'model\.svg_transformer\.transformer\.model\.layers\.\d+\.(self_attn\.(o_proj|qkv_proj)|mlp\.(c_fc|c_proj))']
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+    embedding_padding_modules = []
 
-    def __init__(self, config: StarVectorConfig, **kwargs):
-        super().__init__(config)
+    # check if this is needed
+    # Map HuggingFace weight prefixes to vLLM ones.
+    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={
+        "lm_head.": "language_model.lm_head.",
+        "model.": "language_model.model.",
+    })
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", **kwargs):
+        super().__init__()
+        config: StarVectorConfig = vllm_config.model_config.hf_config
         self.model_name = config._name_or_path
+
         if 'starvector-1b' in self.model_name:
-            self.model = StarVectorModel(config=config, kwargs=kwargs)
+            self.model = StarVectorModel(vllm_config=vllm_config, prefix=prefix, **kwargs)
         else:   
             from vllm.model_executor.models.starvector2 import StarVector2Model
-            self.model = StarVector2Model(config=config, kwargs=kwargs)
-        self.sampler = Sampler()
+            self.model = StarVector2Model(vllm_config=vllm_config, prefix=prefix, **kwargs)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        **kwargs: object,
-    ) -> SamplerOutput:
 
+    def _parse_and_validate_image_input(self, **kwargs: object) -> Optional[dict]:
+        pixel_values = kwargs.pop("pixel_values", None)
+        return pixel_values
+    
+    def forward(self,
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                kv_caches: List[torch.Tensor],
+                attn_metadata: AttentionMetadata,  # typically an AttentionMetadata object
+                intermediate_tensors: Optional[Any] = None,
+                inputs_embeds: Optional[torch.Tensor] = None,
+                pixel_values: torch.Tensor = None,
+                **kwargs: object
+                ) -> Union[torch.Tensor, Any]:
+        
         return self.model(
             input_ids=input_ids,
             positions=positions,
             kv_caches=kv_caches,
             attn_metadata=attn_metadata,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
             **kwargs,
         )
+    def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: Any) -> Optional[torch.Tensor]:
+        return self.model.svg_transformer.transformer.compute_logits(hidden_states, sampling_metadata)
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata
-    ) -> torch.Tensor:
-        backbone_transformer = self.model.svg_transformer.transformer
-        logits = backbone_transformer.logits_processor(
-            backbone_transformer.lm_head_weight, hidden_states, sampling_metadata
-        )
-        return logits
+    def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> Optional[Any]:
+        return self.model.svg_transformer.transformer.sample(logits, sampling_metadata)
 
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
-
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: Set[str] = set()
+        # Define the mapping for stacked parameters.
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
-
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
-            if 'starvector-8b' in self.model_name:
+            # Special treatment for starvector-8b models.
+            if "starvector-8b" in self.model_name:
                 if "rotary_emb.inv_freq" in name:
                     continue
-
-                if 'image_encoder' in name:
+                if "image_encoder" in name:
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
                     continue
-                
+                found = False
                 for (param_name, weight_name, shard_id) in stacked_params_mapping:
-
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    break
-                else:
-                    if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                    new_name = name.replace(weight_name, param_name)
+                    if new_name in params_dict:
+                        param = params_dict[new_name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        loaded_params.add(new_name)
+                        found = True
+                        break
+                if not found:
+                    if "lm_head.weight" in name:
                         continue
+                    if name in params_dict:
+                        param = params_dict[name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, loaded_weight)
+                        loaded_params.add(name)
+            else:
+                # For non-8b models, skip lm_head and BatchNorm / running stats.
+                if "lm_head.weight" in name:
+                    continue
+                if (".num_batches_tracked" in name or ".running_mean" in name or ".running_var" in name):
+                    continue
+                if name in params_dict:
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
-            else:
-                if "lm_head.weight" in name:
-                    continue
-                if (
-                    ".num_batches_tracked" in name
-                    or ".running_mean" in name
-                    or ".running_var" in name
-                ):
-                    # Skip batch norm statistics.
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+        return loaded_params

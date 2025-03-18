@@ -1,48 +1,75 @@
-from transformers import PretrainedConfig, PreTrainedModel
-from argparse import Namespace
-from typing import Iterable, List, Optional, Tuple
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.attention import Attention, AttentionMetadata
-
+from vllm.attention import AttentionMetadata
 import torch.nn as nn
 import torch
-from torch import nn
-
-from vllm.attention import Attention, AttentionMetadata
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    LinearMethodBase,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.sampler import Sampler
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import SamplerOutput
-
-
+from typing import List
 from transformers import AutoTokenizer
-from vllm.model_executor.models.starcoder2 import Starcoder2Config, Starcoder2Model, Starcoder2ForCausalLM
+from vllm.model_executor.models.starcoder2 import Starcoder2ForCausalLM
 from starvector.model.image_encoder.image_encoder import ImageEncoder
 from vllm.model_executor.models.starvector import Adapter
 
 from transformers import AutoConfig
 
+from transformers import AutoImageProcessor
+from transformers.processing_utils import ProcessorMixin
+from transformers import BatchFeature
+
+class StarVector2Processor(ProcessorMixin):
+    attributes = ["tokenizer"]  # Only include tokenizer in attributes
+    # valid_kwargs = ["size", "mean", "std"]  # Additional parameters allowed
+    image_processor_class = "AutoImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+
+    def __init__(self, 
+                 tokenizer=None,  # Make tokenizer the first argument
+                 **kwargs):
+        model_name = tokenizer.name_or_path
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            model_name,
+            **kwargs,
+        )
+        self.size = self.image_processor.size
+        self.mean = self.image_processor.image_mean
+        self.std = self.image_processor.image_std
+        super().__init__(tokenizer=tokenizer)
+
+    def __call__(self, images=None, text=None, **kwargs) -> BatchFeature:
+        """
+        Process images and/or text inputs.
+        
+        Args:
+            images: Optional image input(s)
+            text: Optional text input(s)
+            **kwargs: Additional arguments for the image processor or tokenizer.
+        
+        Returns:
+            BatchFeature containing both image and text features.
+        """
+        if images is None and text is None:
+            raise ValueError("You have to specify at least one of `images` or `text`.")
+
+        image_inputs = {}
+        if images is not None:
+            image_inputs = self.image_processor(images, **kwargs)  # Let the AutoImageProcessor handle images
+        
+        text_inputs = {}
+        if text is not None:
+            text_inputs = self.tokenizer(text, **kwargs)
+        
+        return BatchFeature(data={**text_inputs, **image_inputs})
+
+
 
 class StarCoderModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, vllm_config, prefix: str = "", **kwargs):
         super(StarCoderModel, self).__init__()
 
-        self.init_tokenizer(config.starcoder_model_name)
+        self.init_tokenizer(vllm_config.model_config.hf_config.starcoder_model_name)
 
-        self.max_length = config.max_length
-        model_config = AutoConfig.from_pretrained(config.starcoder_model_name)
+        self.max_length = vllm_config.model_config.hf_config.max_length
+        model_config = AutoConfig.from_pretrained(vllm_config.model_config.hf_config.starcoder_model_name)
 
-        # model_config = AutoConfig.from_pretrained(config.starcoder_model_name, trust_remote_code=True)
         kwargs = {}
-        kwargs["trust_remote_code"] = True
+        # kwargs["trust_remote_code"] = True
 
         # Configure special tokens for generation
         model_config.eos_token_id = self.tokenizer.eos_token_id
@@ -50,8 +77,24 @@ class StarCoderModel(nn.Module):
         model_config.bos_token_id = self.tokenizer.bos_token_id
         model_config.vocab_size = len(self.tokenizer)
 
-        # model = GPTBigCodeForCausalLM(config=model_config)
-        model = Starcoder2ForCausalLM(config=model_config)
+        # vllm_config.model_config.hf_config.n_inner = model_config.n_inner
+        # Update vocabulary size to match the tokenizer
+        vllm_config.model_config.hf_config.vocab_size = len(self.tokenizer)
+        # Map hidden size from starcoder2 config to vllm config
+        
+        vllm_config.model_config.hf_config.hidden_size = model_config.hidden_size
+        vllm_config.model_config.hf_config.layer_norm_epsilon = model_config.layer_norm_epsilon
+        vllm_config.model_config.hf_config.max_position_embeddings = model_config.max_position_embeddings
+        vllm_config.model_config.hf_config.activation_function = model_config.activation_function
+        vllm_config.model_config.hf_config.num_key_value_heads = model_config.num_key_value_heads
+        vllm_config.model_config.hf_config.rope_theta = model_config.rope_theta
+        vllm_config.model_config.hf_config.use_bias = model_config.use_bias
+        vllm_config.model_config.hf_config.num_key_value_heads = model_config.num_key_value_heads
+        vllm_config.model_config.hf_config.intermediate_size = model_config.intermediate_size
+        vllm_config.model_config.hf_config.hidden_act = model_config.hidden_act
+        vllm_config.model_config.hf_config.norm_epsilon = model_config.layer_norm_epsilon
+
+        model = Starcoder2ForCausalLM(vllm_config=vllm_config, prefix=prefix, **kwargs)
         self.transformer = model
 
         # Prompt the model after image
@@ -79,15 +122,17 @@ class StarCoderModel(nn.Module):
         self.tokenizer.padding_side = "left"
 
 class StarVector2Model(nn.Module):
-    def __init__(self, config, kwargs):
+    def __init__(self, vllm_config, prefix: str = "", **kwargs):
         super().__init__()
+        config = vllm_config.model_config.hf_config
+        config.torch_dtype = vllm_config.model_config.dtype
+        self.model_precision = config.torch_dtype
 
         # Build Code LLM (StarCoder)
-        self.svg_transformer = StarCoderModel(config)
+        self.svg_transformer = StarCoderModel(vllm_config, prefix=prefix, **kwargs)
 
         # Task-specific layers
         self.task = kwargs.get("task", "im2svg")
-        self.model_precision = kwargs.get("model_precision",config.torch_dtype)
         self.query_length = 0
         if self.use_image_encoder():
             # Build Image Encoder
@@ -140,6 +185,8 @@ class StarVector2Model(nn.Module):
 
     def _parse_and_validate_image_input(self, **kwargs):
         pixel_values = kwargs.pop("pixel_values", None)
+        if pixel_values is not None and pixel_values.dim() == 5 and pixel_values.size(1) == 1:
+            pixel_values = pixel_values.squeeze(1)
         return pixel_values
 
     def forward(

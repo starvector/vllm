@@ -178,7 +178,7 @@ _MULTIMODAL_MODELS = {
     # [Encoder-decoder]
     "MllamaForConditionalGeneration": ("mllama", "MllamaForConditionalGeneration"),  # noqa: E501
     "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),  # noqa: E501
-    "StarVectorForCausalLM": ("starvector_v2", "StarVectorForCausalLM"),
+    "StarVectorForCausalLM": ("starvector", "StarVectorForCausalLM"),
 }
 
 _SPECULATIVE_DECODING_MODELS = {
